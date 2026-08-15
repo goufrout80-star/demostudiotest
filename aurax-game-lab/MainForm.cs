@@ -22,7 +22,7 @@ public sealed class MainForm : Form
         _state = state;
         _overlay = new OverlayForm(_state);
 
-        Text = "AuraX Game Lab Beta 0.3 Diagnostics";
+        Text = "AuraX Game Lab Beta 0.6 Offline Telemetry";
         StartPosition = FormStartPosition.CenterScreen;
         Size = new Size(760, 860);
         MinimumSize = new Size(760, 760);
@@ -33,9 +33,10 @@ public sealed class MainForm : Form
         BuildUi();
 
         DiagnosticLog.LineAdded += OnLogLine;
-        DiagnosticLog.Info("AuraX Game Lab Beta 0.3 started.");
+        DiagnosticLog.Info("AuraX Game Lab Beta 0.6 started.");
         DiagnosticLog.Info($"Executable folder: {AppContext.BaseDirectory}");
         DiagnosticLog.Info($"Expected process: {_state.ProcessName}.exe");
+        DiagnosticLog.Info($"Offline telemetry path: {OfflineTelemetry.TelemetryPath}");
 
         Shown += (_, _) => _overlay.Show();
         FormClosed += (_, _) =>
@@ -63,7 +64,7 @@ public sealed class MainForm : Form
 
         var subtitle = new Label
         {
-            Text = "Beta 0.3 • AssaultCube offline / bot diagnostics build",
+            Text = "Beta 0.6 • AssaultCube offline/bot telemetry + real entity ESP path",
             ForeColor = Color.FromArgb(165, 165, 175),
             AutoSize = true,
             Location = new Point(31, 70)
@@ -77,9 +78,9 @@ public sealed class MainForm : Form
 
         int y = 145;
         AddToggle("Overlay", "Master overlay switch", y, _state.OverlayEnabled, v => _state.OverlayEnabled = v); y += 55;
-        AddToggle("ESP Preview", "Demo boxes only appear after the game window is detected", y, _state.EspBoxes, v => _state.EspBoxes = v); y += 55;
+        AddToggle("Real Offline ESP", "Uses telemetry only from the modified local bot build; no fake targets", y, _state.EspBoxes, v => _state.EspBoxes = v); y += 55;
         AddToggle("Crosshair", "Centered training crosshair", y, _state.Crosshair, v => _state.Crosshair = v); y += 55;
-        AddToggle("Aim Trainer", "Draw a configurable FOV circle for aim practice", y, _state.AimTrainerFov, v => _state.AimTrainerFov = v); y += 55;
+        AddToggle("Aim Trainer", "FOV visualization only; does not control the game's aim", y, _state.AimTrainerFov, v => _state.AimTrainerFov = v); y += 55;
 
         var fovLabel = new Label { Text = "Aim FOV radius", AutoSize = true, Location = new Point(31, y + 7) };
         Controls.Add(fovLabel);
@@ -96,7 +97,7 @@ public sealed class MainForm : Form
         Controls.Add(fov);
         y += 58;
 
-        AddToggle("Speed Trainer", "Starts a local movement-practice timer", y, false, v =>
+        AddToggle("Speed Trainer", "Local practice timer only; no game-speed modification", y, false, v =>
         {
             _state.SpeedTrainer = v;
             if (v) _speedStart = DateTime.Now;
@@ -108,7 +109,7 @@ public sealed class MainForm : Form
         Controls.Add(_speedReadout);
         y += 65;
 
-        AddToggle("Invulnerability Lab", "Sandbox indicator only; does not patch game memory", y, false, v =>
+        AddToggle("Invulnerability Lab", "Simulation indicator only; does not patch game memory", y, false, v =>
         {
             _state.InvulnerabilitySimulation = v;
             DiagnosticLog.Info($"Invulnerability simulation {(v ? "enabled" : "disabled")}");
@@ -161,7 +162,7 @@ public sealed class MainForm : Form
 
         var note = new Label
         {
-            Text = "Run AssaultCube first, then press Scan Now. If detection still fails, send aurax-log.txt to me.",
+            Text = "Stock AssaultCube has no AuraX telemetry. Real ESP requires the local OFFLINE_TELEMETRY_PATCH.md training build.",
             ForeColor = Color.FromArgb(150, 150, 160),
             AutoSize = true,
             Location = new Point(31, y + 245)
@@ -196,18 +197,23 @@ public sealed class MainForm : Form
     private void RefreshStatus()
     {
         var probe = GameWindowTracker.Probe(_state.ProcessName);
+        string gameState = probe.Found
+            ? (probe.Minimized ? "minimized" : $"{probe.Bounds.Width}x{probe.Bounds.Height}")
+            : "not attached";
+        bool telemetry = OfflineTelemetry.TryRead(out var frame, out var telemetryReason);
+
         _status.Text = probe.Found
-            ? $"● Detected {probe.ProcessName}.exe • PID {probe.ProcessId} • {probe.Bounds.Width}x{probe.Bounds.Height}"
+            ? $"● {probe.ProcessName}.exe PID {probe.ProcessId} • {gameState} • telemetry {(telemetry ? $"ON ({frame.Entities.Count})" : "OFF") }"
             : $"○ Not attached • {probe.Reason}";
         _status.ForeColor = probe.Found ? Color.FromArgb(115, 230, 150) : Color.FromArgb(235, 180, 90);
 
-        string signature = $"{probe.Found}|{probe.ProcessName}|{probe.ProcessId}|{probe.WindowHandle}|{probe.Bounds}|{probe.Reason}|{probe.CandidateProcesses}";
+        string signature = $"{probe.Found}|{probe.Minimized}|{probe.ProcessName}|{probe.ProcessId}|{probe.WindowHandle}|{probe.Bounds}|{probe.Reason}|{probe.CandidateProcesses}";
         if (signature != _lastProbeSignature)
         {
             _lastProbeSignature = signature;
             if (probe.Found)
             {
-                DiagnosticLog.Info($"GAME FOUND process={probe.ProcessName}.exe pid={probe.ProcessId} hwnd=0x{probe.WindowHandle.ToInt64():X} title=\"{probe.WindowTitle}\" bounds={probe.Bounds.X},{probe.Bounds.Y},{probe.Bounds.Width},{probe.Bounds.Height}");
+                DiagnosticLog.Info($"GAME FOUND process={probe.ProcessName}.exe pid={probe.ProcessId} hwnd=0x{probe.WindowHandle.ToInt64():X} title=\"{probe.WindowTitle}\" bounds={probe.Bounds.X},{probe.Bounds.Y},{probe.Bounds.Width},{probe.Bounds.Height} minimized={probe.Minimized} reason={probe.Reason}");
             }
             else
             {
@@ -225,8 +231,10 @@ public sealed class MainForm : Form
     {
         DiagnosticLog.Info("Manual process scan requested.");
         var probe = GameWindowTracker.Probe(_state.ProcessName);
-        DiagnosticLog.Info($"Scan result: found={probe.Found}; process={probe.ProcessName}; pid={probe.ProcessId}; hwnd=0x{probe.WindowHandle.ToInt64():X}; title=\"{probe.WindowTitle}\"; bounds={probe.Bounds}; reason={probe.Reason}");
+        DiagnosticLog.Info($"Scan result: found={probe.Found}; minimized={probe.Minimized}; process={probe.ProcessName}; pid={probe.ProcessId}; hwnd=0x{probe.WindowHandle.ToInt64():X}; title=\"{probe.WindowTitle}\"; bounds={probe.Bounds}; reason={probe.Reason}");
         DiagnosticLog.Info($"Candidates: {probe.CandidateProcesses}");
+        bool telemetry = OfflineTelemetry.TryRead(out var frame, out var reason);
+        DiagnosticLog.Info($"Telemetry scan: active={telemetry}; entities={frame.Entities.Count}; path={OfflineTelemetry.TelemetryPath}; reason={reason}");
     }
 
     private void OpenLogFile()
