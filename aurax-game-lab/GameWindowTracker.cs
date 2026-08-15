@@ -10,6 +10,7 @@ namespace AuraXGameLab;
 
 internal sealed record GameWindowDiagnostic(
     bool Found,
+    bool Minimized,
     string ProcessName,
     int ProcessId,
     string WindowTitle,
@@ -26,21 +27,21 @@ internal static class GameWindowTracker
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X, Y; }
 
-    private const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
-
     [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
     [DllImport("user32.dll")] private static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
     [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
 
+    private const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
     private static readonly string[] KnownNames = { "ac_client", "assaultcube", "assaultcube_client" };
 
     public static bool TryGetClientBounds(string processName, out Rectangle bounds)
     {
         var result = Probe(processName);
         bounds = result.Bounds;
-        return result.Found;
+        return result.Found && !result.Minimized;
     }
 
     public static GameWindowDiagnostic Probe(string preferredProcessName)
@@ -79,7 +80,7 @@ internal static class GameWindowTracker
 
             if (matching.Count == 0)
             {
-                return new GameWindowDiagnostic(false, preferredProcessName, 0, "", IntPtr.Zero, Rectangle.Empty,
+                return new GameWindowDiagnostic(false, false, preferredProcessName, 0, "", IntPtr.Zero, Rectangle.Empty,
                     "No AssaultCube-like process found.", candidates);
             }
 
@@ -95,82 +96,104 @@ internal static class GameWindowTracker
                     if (hwnd == IntPtr.Zero) continue;
                     if (!IsWindowVisible(hwnd)) continue;
 
-                    // 1) Normal windowed path: client rectangle.
+                    // Exclusive fullscreen applications commonly move their HWND to
+                    // (-32000,-32000) with a tiny 160x28 rect when Alt+Tabbed/minimized.
+                    // Never treat that placeholder as a real overlay target.
+                    if (IsIconic(hwnd))
+                    {
+                        Rectangle monitor = SafeMonitorBounds(hwnd);
+                        return new GameWindowDiagnostic(true, true, pname, pid, title, hwnd, monitor,
+                            "Game process/window detected but it is currently minimized. Overlay is paused until AssaultCube is restored.", candidates);
+                    }
+
+                    // 1. Preferred path: actual client area.
                     if (GetClientRect(hwnd, out var clientRect))
                     {
                         int width = clientRect.Right - clientRect.Left;
                         int height = clientRect.Bottom - clientRect.Top;
-                        if (width > 0 && height > 0)
+                        var topLeft = new POINT();
+
+                        if (width > 0 && height > 0 && ClientToScreen(hwnd, ref topLeft))
                         {
-                            var topLeft = new POINT();
-                            if (ClientToScreen(hwnd, ref topLeft))
+                            var clientBounds = new Rectangle(topLeft.X, topLeft.Y, width, height);
+                            if (IsUsableBounds(clientBounds))
                             {
-                                var bounds = new Rectangle(topLeft.X, topLeft.Y, width, height);
-                                return new GameWindowDiagnostic(true, pname, pid, title, hwnd, bounds,
-                                    "Game detected via GetClientRect + ClientToScreen.", candidates);
+                                return new GameWindowDiagnostic(true, false, pname, pid, title, hwnd, clientBounds,
+                                    "Game detected via client bounds.", candidates);
                             }
                         }
                     }
 
-                    // 2) Fullscreen/borderless fallback: DWM extended frame bounds.
+                    // 2. DWM fallback. Reject minimized/off-screen placeholder rectangles.
                     try
                     {
-                        if (DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, out var frameRect, Marshal.SizeOf<RECT>()) == 0)
+                        if (DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, out var dwmRect, Marshal.SizeOf<RECT>()) == 0)
                         {
-                            int width = frameRect.Right - frameRect.Left;
-                            int height = frameRect.Bottom - frameRect.Top;
-                            if (width > 0 && height > 0)
+                            var dwmBounds = ToRectangle(dwmRect);
+                            if (IsUsableBounds(dwmBounds))
                             {
-                                var bounds = new Rectangle(frameRect.Left, frameRect.Top, width, height);
-                                return new GameWindowDiagnostic(true, pname, pid, title, hwnd, bounds,
+                                return new GameWindowDiagnostic(true, false, pname, pid, title, hwnd, dwmBounds,
                                     "Game detected via DWM extended frame bounds fallback.", candidates);
                             }
                         }
                     }
                     catch { }
 
-                    // 3) Raw window rectangle fallback.
+                    // 3. Raw window rectangle fallback.
                     if (GetWindowRect(hwnd, out var windowRect))
                     {
-                        int width = windowRect.Right - windowRect.Left;
-                        int height = windowRect.Bottom - windowRect.Top;
-                        if (width > 0 && height > 0)
+                        var windowBounds = ToRectangle(windowRect);
+                        if (IsUsableBounds(windowBounds))
                         {
-                            var bounds = new Rectangle(windowRect.Left, windowRect.Top, width, height);
-                            return new GameWindowDiagnostic(true, pname, pid, title, hwnd, bounds,
-                                "Game detected via GetWindowRect fullscreen fallback.", candidates);
+                            return new GameWindowDiagnostic(true, false, pname, pid, title, hwnd, windowBounds,
+                                "Game detected via GetWindowRect fallback.", candidates);
                         }
                     }
 
-                    // 4) Last resort for exclusive/fullscreen-like windows: monitor bounds.
-                    try
+                    // 4. Fullscreen monitor fallback. This is appropriate when OpenGL
+                    // reports a 0x0 client rect but the game is visibly fullscreen.
+                    Rectangle monitorBounds = SafeMonitorBounds(hwnd);
+                    if (monitorBounds.Width > 0 && monitorBounds.Height > 0)
                     {
-                        var screen = Screen.FromHandle(hwnd);
-                        if (screen.Bounds.Width > 0 && screen.Bounds.Height > 0)
-                        {
-                            return new GameWindowDiagnostic(true, pname, pid, title, hwnd, screen.Bounds,
-                                "Game detected via monitor-bounds fallback.", candidates);
-                        }
+                        return new GameWindowDiagnostic(true, false, pname, pid, title, hwnd, monitorBounds,
+                            "Game detected via fullscreen monitor-bounds fallback.", candidates);
                     }
-                    catch { }
                 }
                 catch { }
             }
 
             var first = matching[0];
-            string firstName = Safe(() => first.ProcessName, "unknown");
-            int firstPid = Safe(() => first.Id, 0);
-            string firstTitle = Safe(() => first.MainWindowTitle, "");
-            IntPtr firstHandle = Safe(() => first.MainWindowHandle, IntPtr.Zero);
-
-            return new GameWindowDiagnostic(false, firstName, firstPid, firstTitle, firstHandle, Rectangle.Empty,
-                "Matching process found, but Windows exposed no usable client, frame, window, or monitor bounds.", candidates);
+            return new GameWindowDiagnostic(false, false,
+                Safe(() => first.ProcessName, "unknown"),
+                Safe(() => first.Id, 0),
+                Safe(() => first.MainWindowTitle, ""),
+                Safe(() => first.MainWindowHandle, IntPtr.Zero),
+                Rectangle.Empty,
+                "Matching process found, but no usable visible game bounds were available.",
+                candidates);
         }
         catch (Exception ex)
         {
-            return new GameWindowDiagnostic(false, preferredProcessName, 0, "", IntPtr.Zero, Rectangle.Empty,
+            return new GameWindowDiagnostic(false, false, preferredProcessName, 0, "", IntPtr.Zero, Rectangle.Empty,
                 $"Process scan failed: {ex.GetType().Name}: {ex.Message}", "unavailable");
         }
+    }
+
+    private static Rectangle ToRectangle(RECT rect)
+        => new(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
+
+    private static bool IsUsableBounds(Rectangle bounds)
+    {
+        if (bounds.Width < 320 || bounds.Height < 200) return false;
+        if (bounds.X <= -30000 || bounds.Y <= -30000) return false;
+        if (bounds.Right <= -10000 || bounds.Bottom <= -10000) return false;
+        return true;
+    }
+
+    private static Rectangle SafeMonitorBounds(IntPtr hwnd)
+    {
+        try { return Screen.FromHandle(hwnd).Bounds; }
+        catch { return Screen.PrimaryScreen?.Bounds ?? Rectangle.Empty; }
     }
 
     private static string BuildCandidateSummary(Process[] processes)
