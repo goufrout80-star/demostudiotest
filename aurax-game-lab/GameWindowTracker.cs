@@ -4,7 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Text;
+using System.Windows.Forms;
 
 namespace AuraXGameLab;
 
@@ -26,8 +26,13 @@ internal static class GameWindowTracker
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X, Y; }
 
+    private const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+
     [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
     [DllImport("user32.dll")] private static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
+    [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
 
     private static readonly string[] KnownNames = { "ac_client", "assaultcube", "assaultcube_client" };
 
@@ -56,7 +61,6 @@ internal static class GameWindowTracker
                 try { matching.AddRange(Process.GetProcessesByName(name)); } catch { }
             }
 
-            // Fallback: inspect visible process/window names containing Assault/Cube/ac_client.
             foreach (var p in all)
             {
                 try
@@ -88,32 +92,67 @@ internal static class GameWindowTracker
                     IntPtr hwnd = process.MainWindowHandle;
                     string title = process.MainWindowTitle ?? "";
 
-                    if (hwnd == IntPtr.Zero)
+                    if (hwnd == IntPtr.Zero) continue;
+                    if (!IsWindowVisible(hwnd)) continue;
+
+                    // 1) Normal windowed path: client rectangle.
+                    if (GetClientRect(hwnd, out var clientRect))
                     {
-                        continue;
+                        int width = clientRect.Right - clientRect.Left;
+                        int height = clientRect.Bottom - clientRect.Top;
+                        if (width > 0 && height > 0)
+                        {
+                            var topLeft = new POINT();
+                            if (ClientToScreen(hwnd, ref topLeft))
+                            {
+                                var bounds = new Rectangle(topLeft.X, topLeft.Y, width, height);
+                                return new GameWindowDiagnostic(true, pname, pid, title, hwnd, bounds,
+                                    "Game detected via GetClientRect + ClientToScreen.", candidates);
+                            }
+                        }
                     }
 
-                    if (!GetClientRect(hwnd, out var rect))
+                    // 2) Fullscreen/borderless fallback: DWM extended frame bounds.
+                    try
                     {
-                        continue;
+                        if (DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, out var frameRect, Marshal.SizeOf<RECT>()) == 0)
+                        {
+                            int width = frameRect.Right - frameRect.Left;
+                            int height = frameRect.Bottom - frameRect.Top;
+                            if (width > 0 && height > 0)
+                            {
+                                var bounds = new Rectangle(frameRect.Left, frameRect.Top, width, height);
+                                return new GameWindowDiagnostic(true, pname, pid, title, hwnd, bounds,
+                                    "Game detected via DWM extended frame bounds fallback.", candidates);
+                            }
+                        }
+                    }
+                    catch { }
+
+                    // 3) Raw window rectangle fallback.
+                    if (GetWindowRect(hwnd, out var windowRect))
+                    {
+                        int width = windowRect.Right - windowRect.Left;
+                        int height = windowRect.Bottom - windowRect.Top;
+                        if (width > 0 && height > 0)
+                        {
+                            var bounds = new Rectangle(windowRect.Left, windowRect.Top, width, height);
+                            return new GameWindowDiagnostic(true, pname, pid, title, hwnd, bounds,
+                                "Game detected via GetWindowRect fullscreen fallback.", candidates);
+                        }
                     }
 
-                    var topLeft = new POINT();
-                    if (!ClientToScreen(hwnd, ref topLeft))
+                    // 4) Last resort for exclusive/fullscreen-like windows: monitor bounds.
+                    try
                     {
-                        continue;
+                        var screen = Screen.FromHandle(hwnd);
+                        if (screen.Bounds.Width > 0 && screen.Bounds.Height > 0)
+                        {
+                            return new GameWindowDiagnostic(true, pname, pid, title, hwnd, screen.Bounds,
+                                "Game detected via monitor-bounds fallback.", candidates);
+                        }
                     }
-
-                    int width = rect.Right - rect.Left;
-                    int height = rect.Bottom - rect.Top;
-                    if (width <= 0 || height <= 0)
-                    {
-                        continue;
-                    }
-
-                    var bounds = new Rectangle(topLeft.X, topLeft.Y, width, height);
-                    return new GameWindowDiagnostic(true, pname, pid, title, hwnd, bounds,
-                        "Game client window detected.", candidates);
+                    catch { }
                 }
                 catch { }
             }
@@ -125,7 +164,7 @@ internal static class GameWindowTracker
             IntPtr firstHandle = Safe(() => first.MainWindowHandle, IntPtr.Zero);
 
             return new GameWindowDiagnostic(false, firstName, firstPid, firstTitle, firstHandle, Rectangle.Empty,
-                "Matching process found, but it has no usable main client window yet. Try running AssaultCube in windowed/borderless mode and keep the game window open.", candidates);
+                "Matching process found, but Windows exposed no usable client, frame, window, or monitor bounds.", candidates);
         }
         catch (Exception ex)
         {
