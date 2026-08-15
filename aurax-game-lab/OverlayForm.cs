@@ -1,6 +1,7 @@
 using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Numerics;
 using System.Windows.Forms;
 
 namespace AuraXGameLab;
@@ -14,12 +15,15 @@ public sealed class OverlayForm : Form
 
     private readonly AppState _state;
     private readonly System.Windows.Forms.Timer _timer = new();
-    private float _phase;
     private bool _gameFound;
     private bool _lastLoggedFound;
     private bool _lastLoggedMinimized;
     private bool _hasLoggedState;
     private Rectangle _lastGoodBounds = Rectangle.Empty;
+    private OfflineTelemetryFrame _telemetry = new();
+    private bool _telemetryActive;
+    private string _telemetryReason = "Waiting for offline telemetry.";
+    private string _lastTelemetrySignature = "";
 
     public OverlayForm(AppState state)
     {
@@ -52,7 +56,6 @@ public sealed class OverlayForm : Form
 
     private void TickOverlay()
     {
-        _phase += 0.035f;
         var probe = GameWindowTracker.Probe(_state.ProcessName);
         _gameFound = probe.Found && !probe.Minimized;
 
@@ -64,10 +67,6 @@ public sealed class OverlayForm : Form
         }
         else
         {
-            // Exclusive fullscreen AssaultCube moves its HWND to an off-screen
-            // placeholder while Alt+Tabbed. Do not follow it there and do not
-            // render the overlay on the desktop. Keep the last valid game bounds
-            // only for diagnostics and reattach when the game is restored.
             var hidden = HiddenBounds();
             if (Bounds != hidden) Bounds = hidden;
         }
@@ -93,6 +92,19 @@ public sealed class OverlayForm : Form
             }
         }
 
+        _telemetryActive = OfflineTelemetry.TryRead(out _telemetry, out _telemetryReason);
+        string telemetrySignature = _telemetryActive
+            ? $"on|{_telemetry.Entities.Count}"
+            : $"off|{_telemetryReason}";
+        if (telemetrySignature != _lastTelemetrySignature)
+        {
+            _lastTelemetrySignature = telemetrySignature;
+            if (_telemetryActive)
+                DiagnosticLog.Info($"REAL OFFLINE TELEMETRY ACTIVE: {_telemetry.Entities.Count} entities from {OfflineTelemetry.TelemetryPath}");
+            else
+                DiagnosticLog.Warn($"Offline telemetry inactive: {_telemetryReason}");
+        }
+
         Invalidate();
     }
 
@@ -113,9 +125,11 @@ public sealed class OverlayForm : Form
         using var font = new Font("Segoe UI", 9f);
         using var bold = new Font("Segoe UI Semibold", 10f);
 
-        g.FillRectangle(panel, 12, 12, 315, 55);
-        g.DrawString("AuraX Game Lab • Beta 0.5", bold, text, 24, 22);
-        g.DrawString("AssaultCube window detected • diagnostics mode", font, Brushes.LightGray, 24, 43);
+        g.FillRectangle(panel, 12, 12, 390, 55);
+        g.DrawString("AuraX Game Lab • Beta 0.6", bold, text, 24, 22);
+        g.DrawString(_telemetryActive
+            ? $"REAL offline telemetry • {_telemetry.Entities.Count} entities"
+            : "Waiting for offline bot telemetry", font, Brushes.LightGray, 24, 43);
 
         float cx = ClientSize.Width / 2f;
         float cy = ClientSize.Height / 2f;
@@ -132,21 +146,82 @@ public sealed class OverlayForm : Form
             g.DrawEllipse(dim, cx - r, cy - r, r * 2, r * 2);
         }
 
-        // Visual training preview only; these are not game-memory entities.
         if (_state.EspBoxes)
         {
-            DrawTarget(g, "BOT_ALPHA", 100, ClientSize.Width * .27f + MathF.Sin(_phase) * 22f, ClientSize.Height * .28f, 58, 128, "18.4 m", white, text, font);
-            DrawTarget(g, "BOT_BRAVO", 64, ClientSize.Width * .56f + MathF.Cos(_phase * .8f) * 30f, ClientSize.Height * .38f, 50, 112, "31.7 m", white, text, font);
-            DrawTarget(g, "BOT_CHARLIE", 27, ClientSize.Width * .73f - MathF.Sin(_phase) * 18f, ClientSize.Height * .23f, 44, 100, "46.2 m", white, text, font);
+            if (_telemetryActive)
+            {
+                DrawRealOfflineEntities(g, white, text, font);
+            }
+            else
+            {
+                using var waitPanel = new SolidBrush(Color.FromArgb(190, 10, 10, 13));
+                const string waiting = "ESP waiting for OFFLINE telemetry";
+                var sz = g.MeasureString(waiting, bold);
+                g.FillRectangle(waitPanel, cx - sz.Width / 2 - 14, 84, sz.Width + 28, 34);
+                g.DrawString(waiting, bold, text, cx - sz.Width / 2, 92);
+            }
         }
 
         if (_state.InvulnerabilitySimulation)
         {
-            string msg = "INVULNERABILITY LAB: SIMULATION ON";
+            string msg = "INVULNERABILITY LAB: SIMULATION ONLY";
             var size = g.MeasureString(msg, bold);
             g.FillRectangle(panel, cx - size.Width / 2 - 12, ClientSize.Height - 58, size.Width + 24, 34);
             g.DrawString(msg, bold, text, cx - size.Width / 2, ClientSize.Height - 50);
         }
+    }
+
+    private void DrawRealOfflineEntities(Graphics g, Pen pen, Brush text, Font font)
+    {
+        foreach (var entity in _telemetry.Entities)
+        {
+            if (!entity.Alive || entity.Health <= 0) continue;
+
+            var world = new Vector3(entity.X, entity.Y, entity.Z);
+            if (!TryWorldToScreen(world, _telemetry.Camera, ClientSize.Width, ClientSize.Height, out var screen, out float distance))
+                continue;
+
+            float h = Math.Clamp(900f / Math.Max(distance, 1f), 30f, 220f);
+            float w = h * 0.44f;
+            float x = screen.X - w / 2f;
+            float y = screen.Y - h * 0.52f;
+            string dist = $"{distance:0.0} u";
+            DrawTarget(g, entity.Name, entity.Health, x, y, w, h, dist, pen, text, font);
+        }
+    }
+
+    private static bool TryWorldToScreen(Vector3 world, TelemetryCamera camera, int width, int height, out PointF screen, out float distance)
+    {
+        screen = PointF.Empty;
+        var cam = new Vector3(camera.X, camera.Y, camera.Z);
+        var rel = world - cam;
+        distance = rel.Length();
+        if (distance < 0.01f) return false;
+
+        float yaw = camera.Yaw * MathF.PI / 180f;
+        float pitch = camera.Pitch * MathF.PI / 180f;
+
+        var forward = Vector3.Normalize(new Vector3(
+            -MathF.Sin(yaw) * MathF.Cos(pitch),
+             MathF.Cos(yaw) * MathF.Cos(pitch),
+             MathF.Sin(pitch)));
+        var right = Vector3.Normalize(new Vector3(MathF.Cos(yaw), MathF.Sin(yaw), 0f));
+        var up = Vector3.Normalize(Vector3.Cross(right, forward));
+
+        float depth = Vector3.Dot(rel, forward);
+        if (depth <= 0.05f) return false;
+
+        float horizontal = Vector3.Dot(rel, right);
+        float vertical = Vector3.Dot(rel, up);
+        float fov = Math.Clamp(camera.Fov, 30f, 140f) * MathF.PI / 180f;
+        float focal = height / (2f * MathF.Tan(fov / 2f));
+
+        float sx = width / 2f + (horizontal / depth) * focal;
+        float sy = height / 2f - (vertical / depth) * focal;
+        if (sx < -200 || sx > width + 200 || sy < -300 || sy > height + 300) return false;
+
+        screen = new PointF(sx, sy);
+        return true;
     }
 
     private static void DrawTarget(Graphics g, string name, int hp, float x, float y, float w, float h, string distance, Pen pen, Brush text, Font font)
