@@ -2,12 +2,24 @@ using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace AuraXGameLab;
 
 public sealed class MainForm : Form
 {
+    private const int WM_HOTKEY = 0x0312;
+    private const int HOTKEY_ID_F2 = 0xA642;
+    private const uint MOD_NOREPEAT = 0x4000;
+    private const uint VK_F2 = 0x71;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
     private readonly AppState _state;
     private readonly OverlayForm _overlay;
     private readonly Label _status = new();
@@ -16,13 +28,14 @@ public sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _uiTimer = new();
     private DateTime _speedStart;
     private string _lastProbeSignature = "";
+    private bool _hotkeyRegistered;
 
     public MainForm(AppState state)
     {
         _state = state;
         _overlay = new OverlayForm(_state);
 
-        Text = "AuraX Game Lab Beta 0.6 Offline Telemetry";
+        Text = "AuraX Game Lab Beta 0.7 Offline Training Control";
         StartPosition = FormStartPosition.CenterScreen;
         Size = new Size(760, 860);
         MinimumSize = new Size(760, 760);
@@ -33,14 +46,20 @@ public sealed class MainForm : Form
         BuildUi();
 
         DiagnosticLog.LineAdded += OnLogLine;
-        DiagnosticLog.Info("AuraX Game Lab Beta 0.6 started.");
+        DiagnosticLog.Info("AuraX Game Lab Beta 0.7 started.");
         DiagnosticLog.Info($"Executable folder: {AppContext.BaseDirectory}");
         DiagnosticLog.Info($"Expected process: {_state.ProcessName}.exe");
         DiagnosticLog.Info($"Offline telemetry path: {OfflineTelemetry.TelemetryPath}");
 
-        Shown += (_, _) => _overlay.Show();
+        Shown += (_, _) =>
+        {
+            _overlay.Show();
+            RegisterMenuHotkey();
+        };
+
         FormClosed += (_, _) =>
         {
+            if (_hotkeyRegistered) UnregisterHotKey(Handle, HOTKEY_ID_F2);
             DiagnosticLog.Info("Application closing.");
             DiagnosticLog.LineAdded -= OnLogLine;
             _overlay.Close();
@@ -49,6 +68,42 @@ public sealed class MainForm : Form
         _uiTimer.Interval = 500;
         _uiTimer.Tick += (_, _) => RefreshStatus();
         _uiTimer.Start();
+    }
+
+    private void RegisterMenuHotkey()
+    {
+        _hotkeyRegistered = RegisterHotKey(Handle, HOTKEY_ID_F2, MOD_NOREPEAT, VK_F2);
+        if (_hotkeyRegistered)
+            DiagnosticLog.Info("Global F2 menu hotkey registered. Press F2 to hide/show AuraX.");
+        else
+            DiagnosticLog.Warn($"Could not register global F2 hotkey. Win32 error={Marshal.GetLastWin32Error()}");
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_ID_F2)
+        {
+            ToggleMenuVisibility();
+            return;
+        }
+        base.WndProc(ref m);
+    }
+
+    private void ToggleMenuVisibility()
+    {
+        if (Visible && WindowState != FormWindowState.Minimized)
+        {
+            Hide();
+            DiagnosticLog.Info("Menu hidden with F2.");
+        }
+        else
+        {
+            Show();
+            WindowState = FormWindowState.Normal;
+            BringToFront();
+            Activate();
+            DiagnosticLog.Info("Menu shown with F2.");
+        }
     }
 
     private void BuildUi()
@@ -64,7 +119,7 @@ public sealed class MainForm : Form
 
         var subtitle = new Label
         {
-            Text = "Beta 0.6 • AssaultCube offline/bot telemetry + real entity ESP path",
+            Text = "Beta 0.7 • offline/bot control build • F2 hides/shows this menu",
             ForeColor = Color.FromArgb(165, 165, 175),
             AutoSize = true,
             Location = new Point(31, 70)
@@ -78,9 +133,9 @@ public sealed class MainForm : Form
 
         int y = 145;
         AddToggle("Overlay", "Master overlay switch", y, _state.OverlayEnabled, v => _state.OverlayEnabled = v); y += 55;
-        AddToggle("Real Offline ESP", "Uses telemetry only from the modified local bot build; no fake targets", y, _state.EspBoxes, v => _state.EspBoxes = v); y += 55;
+        AddToggle("Real Offline ESP", "Uses telemetry from the modified local bot build; no fake targets", y, _state.EspBoxes, v => _state.EspBoxes = v); y += 55;
         AddToggle("Crosshair", "Centered training crosshair", y, _state.Crosshair, v => _state.Crosshair = v); y += 55;
-        AddToggle("Aim Trainer", "FOV visualization only; does not control the game's aim", y, _state.AimTrainerFov, v => _state.AimTrainerFov = v); y += 55;
+        AddToggle("Aim Trainer", "FOV visualization; gameplay aim assist belongs in the offline source-mod build", y, _state.AimTrainerFov, v => _state.AimTrainerFov = v); y += 55;
 
         var fovLabel = new Label { Text = "Aim FOV radius", AutoSize = true, Location = new Point(31, y + 7) };
         Controls.Add(fovLabel);
@@ -97,7 +152,7 @@ public sealed class MainForm : Form
         Controls.Add(fov);
         y += 58;
 
-        AddToggle("Speed Trainer", "Local practice timer only; no game-speed modification", y, false, v =>
+        AddToggle("Speed Trainer", "Practice timer here; real speed modifier is offline-fork-only", y, false, v =>
         {
             _state.SpeedTrainer = v;
             if (v) _speedStart = DateTime.Now;
@@ -109,7 +164,7 @@ public sealed class MainForm : Form
         Controls.Add(_speedReadout);
         y += 65;
 
-        AddToggle("Invulnerability Lab", "Simulation indicator only; does not patch game memory", y, false, v =>
+        AddToggle("Invulnerability Lab", "Indicator here; real invulnerability is offline-fork-only", y, false, v =>
         {
             _state.InvulnerabilitySimulation = v;
             DiagnosticLog.Info($"Invulnerability simulation {(v ? "enabled" : "disabled")}");
@@ -162,7 +217,7 @@ public sealed class MainForm : Form
 
         var note = new Label
         {
-            Text = "Stock AssaultCube has no AuraX telemetry. Real ESP requires the local OFFLINE_TELEMETRY_PATCH.md training build.",
+            Text = "F2 = hide/show menu globally. Stock AssaultCube does not expose gameplay telemetry or offline modifiers.",
             ForeColor = Color.FromArgb(150, 150, 160),
             AutoSize = true,
             Location = new Point(31, y + 245)
@@ -203,7 +258,7 @@ public sealed class MainForm : Form
         bool telemetry = OfflineTelemetry.TryRead(out var frame, out var telemetryReason);
 
         _status.Text = probe.Found
-            ? $"● {probe.ProcessName}.exe PID {probe.ProcessId} • {gameState} • telemetry {(telemetry ? $"ON ({frame.Entities.Count})" : "OFF") }"
+            ? $"● {probe.ProcessName}.exe PID {probe.ProcessId} • {gameState} • telemetry {(telemetry ? $"ON ({frame.Entities.Count})" : "OFF")}"
             : $"○ Not attached • {probe.Reason}";
         _status.ForeColor = probe.Found ? Color.FromArgb(115, 230, 150) : Color.FromArgb(235, 180, 90);
 
