@@ -22,13 +22,15 @@ jobs:
         shell: pwsh
         run: dotnet publish aurax-game-lab/AuraXGameLab.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -p:DebugSymbols=false -o output
 
-      - name: Copy notice
+      - name: Copy docs
         shell: pwsh
-        run: Copy-Item aurax-game-lab/README.md output/README.txt
+        run: |
+          Copy-Item aurax-game-lab/README.md output/README.txt
+          Copy-Item aurax-game-lab/OFFLINE_TELEMETRY_PATCH.md output/OFFLINE_TELEMETRY_PATCH.md
 
       - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
-          name: AuraX-Game-Lab-Beta-0.2-Standalone-Windows-x64
+          name: AuraX-Game-Lab-Beta-0.6-Offline-Telemetry-Windows-x64
           path: output/
           if-no-files-found: error
