@@ -1,7 +1,6 @@
 using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
-using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace AuraXGameLab;
@@ -17,6 +16,8 @@ public sealed class OverlayForm : Form
     private readonly System.Windows.Forms.Timer _timer = new();
     private float _phase;
     private bool _gameFound;
+    private bool _lastLoggedFound;
+    private bool _hasLoggedState;
 
     public OverlayForm(AppState state)
     {
@@ -28,7 +29,7 @@ public sealed class OverlayForm : Form
         BackColor = Color.Fuchsia;
         TransparencyKey = Color.Fuchsia;
         DoubleBuffered = true;
-        Bounds = new Rectangle(100, 100, 900, 600);
+        Bounds = new Rectangle(-10000, -10000, 10, 10);
 
         _timer.Interval = 16;
         _timer.Tick += (_, _) => TickOverlay();
@@ -50,25 +51,38 @@ public sealed class OverlayForm : Form
     private void TickOverlay()
     {
         _phase += 0.035f;
-        if (GameWindowTracker.TryGetClientBounds(_state.ProcessName, out var bounds))
+        var probe = GameWindowTracker.Probe(_state.ProcessName);
+        _gameFound = probe.Found;
+
+        if (_gameFound)
         {
-            _gameFound = true;
-            if (Bounds != bounds) Bounds = bounds;
+            if (Bounds != probe.Bounds) Bounds = probe.Bounds;
+            if (!Visible) Show();
         }
         else
         {
-            _gameFound = false;
-            var area = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1280, 720);
-            var preview = new Rectangle(area.Right - 920, area.Bottom - 640, 880, 580);
-            if (Bounds != preview) Bounds = preview;
+            // No fake desktop preview. Keep the transparent overlay off-screen until a real game window exists.
+            var hidden = new Rectangle(-10000, -10000, 10, 10);
+            if (Bounds != hidden) Bounds = hidden;
         }
+
+        if (!_hasLoggedState || _lastLoggedFound != _gameFound)
+        {
+            _hasLoggedState = true;
+            _lastLoggedFound = _gameFound;
+            if (_gameFound)
+                DiagnosticLog.Info($"Overlay attached to {probe.ProcessName}.exe pid={probe.ProcessId} bounds={probe.Bounds.Width}x{probe.Bounds.Height}");
+            else
+                DiagnosticLog.Warn($"Overlay detached: {probe.Reason}");
+        }
+
         Invalidate();
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
-        if (!_state.OverlayEnabled) return;
+        if (!_state.OverlayEnabled || !_gameFound) return;
 
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
@@ -80,9 +94,9 @@ public sealed class OverlayForm : Form
         using var font = new Font("Segoe UI", 9f);
         using var bold = new Font("Segoe UI Semibold", 10f);
 
-        g.FillRectangle(panel, 12, 12, 290, 55);
-        g.DrawString("AuraX Game Lab • Beta 0.2", bold, text, 24, 22);
-        g.DrawString(_gameFound ? "AssaultCube detected • offline/bot lab" : "Preview mode • launch AssaultCube", font, Brushes.LightGray, 24, 43);
+        g.FillRectangle(panel, 12, 12, 315, 55);
+        g.DrawString("AuraX Game Lab • Beta 0.3", bold, text, 24, 22);
+        g.DrawString("AssaultCube window detected • diagnostics mode", font, Brushes.LightGray, 24, 43);
 
         float cx = ClientSize.Width / 2f;
         float cy = ClientSize.Height / 2f;
@@ -99,6 +113,7 @@ public sealed class OverlayForm : Form
             g.DrawEllipse(dim, cx - r, cy - r, r * 2, r * 2);
         }
 
+        // Still a visual training preview: these boxes are not game-memory data.
         if (_state.EspBoxes)
         {
             DrawTarget(g, "BOT_ALPHA", 100, ClientSize.Width * .27f + MathF.Sin(_phase) * 22f, ClientSize.Height * .28f, 58, 128, "18.4 m", white, text, font);
