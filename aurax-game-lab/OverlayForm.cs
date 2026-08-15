@@ -17,7 +17,9 @@ public sealed class OverlayForm : Form
     private float _phase;
     private bool _gameFound;
     private bool _lastLoggedFound;
+    private bool _lastLoggedMinimized;
     private bool _hasLoggedState;
+    private Rectangle _lastGoodBounds = Rectangle.Empty;
 
     public OverlayForm(AppState state)
     {
@@ -29,7 +31,7 @@ public sealed class OverlayForm : Form
         BackColor = Color.Fuchsia;
         TransparencyKey = Color.Fuchsia;
         DoubleBuffered = true;
-        Bounds = new Rectangle(-10000, -10000, 10, 10);
+        Bounds = HiddenBounds();
 
         _timer.Interval = 16;
         _timer.Tick += (_, _) => TickOverlay();
@@ -52,32 +54,49 @@ public sealed class OverlayForm : Form
     {
         _phase += 0.035f;
         var probe = GameWindowTracker.Probe(_state.ProcessName);
-        _gameFound = probe.Found;
+        _gameFound = probe.Found && !probe.Minimized;
 
         if (_gameFound)
         {
+            _lastGoodBounds = probe.Bounds;
             if (Bounds != probe.Bounds) Bounds = probe.Bounds;
             if (!Visible) Show();
         }
         else
         {
-            // No fake desktop preview. Keep the transparent overlay off-screen until a real game window exists.
-            var hidden = new Rectangle(-10000, -10000, 10, 10);
+            // Exclusive fullscreen AssaultCube moves its HWND to an off-screen
+            // placeholder while Alt+Tabbed. Do not follow it there and do not
+            // render the overlay on the desktop. Keep the last valid game bounds
+            // only for diagnostics and reattach when the game is restored.
+            var hidden = HiddenBounds();
             if (Bounds != hidden) Bounds = hidden;
         }
 
-        if (!_hasLoggedState || _lastLoggedFound != _gameFound)
+        if (!_hasLoggedState || _lastLoggedFound != probe.Found || _lastLoggedMinimized != probe.Minimized)
         {
             _hasLoggedState = true;
-            _lastLoggedFound = _gameFound;
-            if (_gameFound)
-                DiagnosticLog.Info($"Overlay attached to {probe.ProcessName}.exe pid={probe.ProcessId} bounds={probe.Bounds.Width}x{probe.Bounds.Height}");
+            _lastLoggedFound = probe.Found;
+            _lastLoggedMinimized = probe.Minimized;
+
+            if (probe.Found && probe.Minimized)
+            {
+                string last = _lastGoodBounds.IsEmpty ? "none" : $"{_lastGoodBounds.Width}x{_lastGoodBounds.Height}";
+                DiagnosticLog.Info($"Overlay paused: AssaultCube minimized. Last valid bounds={last}");
+            }
+            else if (probe.Found)
+            {
+                DiagnosticLog.Info($"Overlay attached to {probe.ProcessName}.exe pid={probe.ProcessId} bounds={probe.Bounds.Width}x{probe.Bounds.Height} ({probe.Reason})");
+            }
             else
+            {
                 DiagnosticLog.Warn($"Overlay detached: {probe.Reason}");
+            }
         }
 
         Invalidate();
     }
+
+    private static Rectangle HiddenBounds() => new(-10000, -10000, 10, 10);
 
     protected override void OnPaint(PaintEventArgs e)
     {
@@ -95,7 +114,7 @@ public sealed class OverlayForm : Form
         using var bold = new Font("Segoe UI Semibold", 10f);
 
         g.FillRectangle(panel, 12, 12, 315, 55);
-        g.DrawString("AuraX Game Lab • Beta 0.3", bold, text, 24, 22);
+        g.DrawString("AuraX Game Lab • Beta 0.5", bold, text, 24, 22);
         g.DrawString("AssaultCube window detected • diagnostics mode", font, Brushes.LightGray, 24, 43);
 
         float cx = ClientSize.Width / 2f;
@@ -113,7 +132,7 @@ public sealed class OverlayForm : Form
             g.DrawEllipse(dim, cx - r, cy - r, r * 2, r * 2);
         }
 
-        // Still a visual training preview: these boxes are not game-memory data.
+        // Visual training preview only; these are not game-memory entities.
         if (_state.EspBoxes)
         {
             DrawTarget(g, "BOT_ALPHA", 100, ClientSize.Width * .27f + MathF.Sin(_phase) * 22f, ClientSize.Height * .28f, 58, 128, "18.4 m", white, text, font);
